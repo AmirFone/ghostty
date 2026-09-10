@@ -1,0 +1,115 @@
+name: Build macOS App
+
+# Builds Ghostty.app on a GitHub-hosted macOS runner, which already has Xcode
+# installed. Upstream's own macOS jobs run on private Namespace runners that a
+# fork can't use.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/voiceover-selection-reads-whole-buffer
+
+jobs:
+  build:
+    runs-on: macos-26
+    env:
+      ZIG_GLOBAL_CACHE_DIR: /Users/runner/zig/global-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show available Xcode versions
+        run: ls /Applications | grep -i '^Xcode' || true
+
+      - name: Select newest Xcode
+        run: |
+          latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          xcodebuild -version
+          xcrun -sdk macosx metal --version 2>&1 | head -2 || echo "metal missing"
+
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz \
+            https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          mkdir -p /tmp/zig && tar -xJf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
+          echo "/tmp/zig" >> $GITHUB_PATH
+
+      - name: Zig version
+        run: zig version
+
+      - name: Build libghostty
+        run: zig build -Demit-macos-app=false
+
+      - name: Build Ghostty.app
+        run: |
+          xcodebuild \
+            -project macos/Ghostty.xcodeproj \
+            -scheme Ghostty \
+            -configuration ReleaseLocal \
+            SYMROOT="$PWD/macos/build" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Verify app was produced
+        run: |
+          APP="macos/build/ReleaseLocal/Ghostty.app"
+          test -d "$APP" || { echo "no app at $APP"; ls -R macos/build | head -50; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist" || true
+          du -sh "$APP"
+
+      - name: Package
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            macos/build/ReleaseLocal/Ghostty.app \
+            Ghostty-voiceover-fix.zip
+          shasum -a 256 Ghostty-voiceover-fix.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghostty-voiceover-fix
+          path: Ghostty-voiceover-fix.zip
+          retention-days: 30
+
+  test:
+    runs-on: macos-26
+    env:
+      ZIG_GLOBAL_CACHE_DIR: /Users/runner/zig/global-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$latest/Contents/Developer"
+
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz \
+            https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          mkdir -p /tmp/zig && tar -xJf /tmp/zig.tar.xz -C /tmp/zig --strip-components=1
+          echo "/tmp/zig" >> $GITHUB_PATH
+
+      - name: Build libghostty
+        run: zig build -Demit-macos-app=false
+
+      - name: Run unit tests
+        run: |
+          xcodebuild \
+            -project macos/Ghostty.xcodeproj \
+            -scheme Ghostty \
+            -configuration Debug \
+            SYMROOT="$PWD/macos/build" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -skip-testing GhosttyUITests \
+            test
