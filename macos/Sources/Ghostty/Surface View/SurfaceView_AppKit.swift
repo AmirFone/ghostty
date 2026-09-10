@@ -223,6 +223,11 @@ extension Ghostty {
         private(set) var cachedScreenContents: CachedValue<String>
         private(set) var cachedVisibleContents: CachedValue<String>
 
+        // The cached view of the surface that accessibility clients see. This is
+        // captured as a unit so the value and the selection we report can never
+        // describe two different moments in time.
+        private(set) var accessibilitySnapshot: CachedValue<AccessibilitySnapshot>
+
         /// Event monitor (see individual events for why)
         private var eventMonitor: Any?
 
@@ -244,6 +249,7 @@ extension Ghostty {
             // fix at some point.
             self.cachedScreenContents = .init(duration: .milliseconds(500)) { "" }
             self.cachedVisibleContents = self.cachedScreenContents
+            self.accessibilitySnapshot = .init(duration: .milliseconds(250)) { .empty }
 
             // Initialize with some default frame size. The important thing is that this
             // is non-zero so that our layer bounds are non-zero so that our renderer
@@ -292,6 +298,13 @@ extension Ghostty {
                 return String(cString: text.text)
             }
 
+            // Screen readers poll these far more often than the other caches,
+            // but each capture is two reads of the surface so we still throttle.
+            accessibilitySnapshot = .init(duration: .milliseconds(250)) { [weak self] in
+                guard let self else { return .empty }
+                return self.captureAccessibilitySnapshot()
+            }
+
             // Set a timer to show the ghost emoji after 500ms if no title is set
             titleFallbackTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                 if let self = self, self.title.isEmpty {
@@ -320,6 +333,12 @@ extension Ghostty {
                 .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
                 .sink { [weak self] in
                     guard let self else { return }
+
+                    // Our cached snapshot predates this change. Drop it so the
+                    // notification below is answered with the new selection
+                    // rather than the previous one.
+                    self.accessibilitySnapshot.invalidate()
+
                     NSAccessibility.post(element: self, notification: .selectedTextChanged)
                 }
 
@@ -2309,108 +2328,6 @@ extension Ghostty.SurfaceView {
     }
 }
 
-// MARK: Accessibility
-
-extension Ghostty.SurfaceView {
-    /// Indicates that this view should be exposed to accessibility tools like VoiceOver.
-    /// By returning true, we make the terminal surface accessible to screen readers
-    /// and other assistive technologies.
-    override func isAccessibilityElement() -> Bool {
-         return true
-     }
-
-    /// Defines the accessibility role for this view, which helps assistive technologies
-    /// understand what kind of content this view contains and how users can interact with it.
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        /// We use .textArea because the terminal surface is essentially an editable text area
-        /// where users can input commands and view output.
-        return .textArea
-    }
-
-    override func accessibilityHelp() -> String? {
-        return "Terminal content area"
-    }
-
-    override func accessibilityValue() -> Any? {
-        return cachedScreenContents.get()
-    }
-
-    /// Returns the range of text that is currently selected in the terminal.
-    /// This allows VoiceOver and other assistive technologies to understand
-    /// what text the user has selected.
-    override func accessibilitySelectedTextRange() -> NSRange {
-        return selectedRange()
-    }
-
-    /// Returns the currently selected text as a string.
-    /// This allows assistive technologies to read the selected content.
-    override func accessibilitySelectedText() -> String? {
-        guard let surface = self.surface else { return nil }
-
-        // Attempt to read the selection
-        var text = ghostty_text_s()
-        guard ghostty_surface_read_selection(surface, &text) else { return nil }
-        defer { ghostty_surface_free_text(surface, &text) }
-
-        let str = String(cString: text.text)
-        return str.isEmpty ? nil : str
-    }
-
-    /// Returns the number of characters in the terminal content.
-    /// This helps assistive technologies understand the size of the content.
-    override func accessibilityNumberOfCharacters() -> Int {
-        let content = cachedScreenContents.get()
-        return content.count
-    }
-
-    /// Returns the visible character range for the terminal.
-    /// For terminals, we typically show all content as visible.
-    override func accessibilityVisibleCharacterRange() -> NSRange {
-        let content = cachedScreenContents.get()
-        return NSRange(location: 0, length: content.count)
-    }
-
-    /// Returns the line number for a given character index.
-    /// This helps assistive technologies navigate by line.
-    override func accessibilityLine(for index: Int) -> Int {
-        let content = cachedScreenContents.get()
-        let substring = String(content.prefix(index))
-        return substring.components(separatedBy: .newlines).count - 1
-    }
-
-    /// Returns a substring for the given range.
-    /// This allows assistive technologies to read specific portions of the content.
-    override func accessibilityString(for range: NSRange) -> String? {
-        let content = cachedScreenContents.get()
-        guard let swiftRange = Range(range, in: content) else { return nil }
-        return String(content[swiftRange])
-    }
-
-    /// Returns an attributed string for the given range.
-    ///
-    /// Note: right now this only applies font information. One day it'd be nice to extend
-    /// this to copy styling information as well but we need to augment Ghostty core to
-    /// expose that.
-    ///
-    /// This provides styling information to assistive technologies.
-    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
-        guard let surface = self.surface else { return nil }
-        guard let plainString = accessibilityString(for: range) else { return nil }
-
-        var attributes: [NSAttributedString.Key: Any] = [:]
-
-        // Try to get the font from the surface
-        if let fontRaw = ghostty_surface_quicklook_font(surface) {
-            let font = Unmanaged<CTFont>.fromOpaque(fontRaw)
-            attributes[.font] = font.takeUnretainedValue()
-            font.release()
-        }
-
-        return NSAttributedString(string: plainString, attributes: attributes)
-    }
-
-}
-
 /// Caches a value for some period of time, evicting it automatically when that time expires.
 /// We use this to cache our surface content. This probably should be extracted some day
 /// to a more generic helper.
@@ -2459,11 +2376,18 @@ class CachedValue<T> {
         return result
     }
 
+    /// Drop any cached value so the next `get` refetches. Used when we know the
+    /// underlying data changed and can't wait out the duration.
+    func invalidate() {
+        expire()
+    }
+
     private func expire() {
         lock.lock()
         defer { lock.unlock() }
 
         value = nil
+        expiryTask?.cancel()
         expiryTask = nil
     }
 }
